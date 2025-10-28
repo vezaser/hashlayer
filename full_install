@@ -1,132 +1,168 @@
-#!/bin/bash
+bash -lc '
 set -e
-echo "=== 🧱 HASHLAYER AUTO INSTALL START ==="
+echo "=== HASHLAYER AUTO INSTALL ==="
 
-# ============================
-# (A) Wstępne narzędzia
-# ============================
+# A) narzędzia
 sudo apt update && sudo apt install -y curl git build-essential tmux
 
-# ============================
-# (B) Instalacja Node.js 22 przez NVM (bez kolizji z apt)
-# ============================
+# B) NVM + Node 22
 if [ ! -d "$HOME/.nvm" ]; then
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 fi
-
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
-
 nvm install 22
 nvm alias default 22
-node -v
-npm -v
+nvm use 22
+node -v && npm -v
 
-# ============================
-# (C) Pobranie minera
-# ============================
+# C) repo minera
 cd ~
-if [ -d "hash-layer-miner" ]; then
-  echo "📁 Folder hash-layer-miner już istnieje, pomijam klonowanie."
-else
+if [ ! -d hash-layer-miner ]; then
   git clone https://github.com/GemsGame/hash-layer-miner.git
 fi
-cd hash-layer-miner
+cd ~/hash-layer-miner
 
-# ============================
-# (D) Instalacja zależności
-# ============================
+# D) zależności + build
+rm -rf node_modules package-lock.json dist
 npm install
-
-# ============================
-# (E) Utworzenie pliku .env.secrets
-# ============================
-echo "✏️ Wklej teraz swoje 12 słów seed (Sui mnemonic):"
-read -r SEED
-cat > .env.secrets <<EOF
-MNEMONIC="$SEED"
-SUI_RPC="https://fullnode.mainnet.sui.io:443"
-EOF
-
-chmod 600 .env.secrets
-echo "✅ Zapisano plik .env.secrets"
-
-# ============================
-# (F) Kompilacja TypeScript
-# ============================
 npx tsc
-echo "✅ TypeScript skompilowany"
 
-# ============================
-# (G) Dodanie monitora
-# ============================
-cat > monitor-lite.cjs <<'EOF'
-const fs = require("fs");
-const path = require("path");
-const dotenv = require("dotenv");
-dotenv.config({ path: ".env.secrets" });
-const { getFullnodeUrl, SuiClient } = require("@mysten/sui");
+# E) zebrać sekrety
+echo
+read -p "Wklej MNEMONIC (12 słów Sui): " MN
+read -p "Wklej ADDRESS (0x...): " ADDR
 
-const rpc = process.env.SUI_RPC || getFullnodeUrl("mainnet");
-const mnemonic = process.env.MNEMONIC;
-const sui = new SuiClient({ url: rpc });
+# F) .env.secrets
+cat > .env.secrets <<EOF
+MNEMONIC="$MN"
+ADDRESS="$ADDR"
+SUI_RPC="https://fullnode.mainnet.sui.io:443"
+HASH_COIN_TYPE="0x5a583ea201476bdf01162c78ef43a4e30172958755eb9aac6a0da0ec2ef0e295::hash::HASH"
+EOF
+chmod 600 .env.secrets
+echo "✔ Zapisano ~/hash-layer-miner/.env.secrets"
 
-const WALLET_FILE = path.join(__dirname, "wallet.txt");
+# G) monitor (wersja bez @mysten/sui)
+cat > monitor-lite.cjs <<'\CJS'
+// monitor-lite.cjs — saldo SUI + saldo HASH + ostatnie SUCCESS/FAIL z miner.log (bez @mysten/sui)
+const { exec } = require("child_process");
+require("dotenv").config({ path: ".env.secrets" });
+
+const LOG_FILE = "./miner.log";
+const RPC = process.env.SUI_RPC || "https://fullnode.mainnet.sui.io:443";
+const ADDRESS = (process.env.ADDRESS || "").trim().toLowerCase();
+const HASH_COIN = (process.env.HASH_COIN_TYPE || "").trim();
+
+if (!ADDRESS) {
+  console.error('Brak ADDRESS w .env.secrets — dodaj: ADDRESS="0x..."');
+  process.exit(1);
+}
+if (!HASH_COIN) {
+  console.error('Brak HASH_COIN_TYPE w .env.secrets');
+  process.exit(1);
+}
+
+function rpcCall(method, params) {
+  return fetch(RPC, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+  }).then((r) => r.json());
+}
+
+function tailLines(n, file) {
+  return new Promise((res) => {
+    exec(`tail -n ${n} ${file}`, { maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+      if (err) return res("");
+      res(out || "");
+    });
+  });
+}
+
+function extractEvents(txt) {
+  const lines = txt.split("\n").reverse();
+  const events = [];
+  for (const L of lines) {
+    if (/status:\s*'success'|status:\s*success/i.test(L)) events.push("✅ SUCCESS");
+    if (/status:\s*'failure'|status:\s*failure|MoveAbort/i.test(L)) events.push("❌ FAIL");
+    if (events.length >= 6) break;
+  }
+  return events.reverse().join(" | ") || "(brak)";
+}
+
+async function getSuiBalance(addr) {
+  const out = await rpcCall("suix_getBalance", [addr, "0x2::sui::SUI"]).catch(() => null);
+  const raw = out?.result?.totalBalance;
+  if (!raw) return NaN;
+  return Number(raw) / 1e9; // 1 SUI = 1e9
+}
+
+const metaCache = new Map(); // coinType -> metadata
+async function getCoinMetadata(coinType) {
+  if (metaCache.has(coinType)) return metaCache.get(coinType);
+  const out = await rpcCall("suix_getCoinMetadata", [coinType]).catch(() => null);
+  const md = out?.result || null;
+  metaCache.set(coinType, md);
+  return md;
+}
+
+async function getCoinBalance(addr, coinType) {
+  const out = await rpcCall("suix_getBalance", [addr, coinType]).catch(() => null);
+  const raw = out?.result?.totalBalance;
+  if (!raw) return { amount: NaN, decimals: 0, symbol: "??" };
+  const md = await getCoinMetadata(coinType);
+  const decimals = md?.decimals ?? 9;
+  const symbol = md?.symbol ?? "HASH";
+  const amount = Number(raw) / 10 ** decimals;
+  return { amount, decimals, symbol };
+}
 
 (async () => {
-  console.log(`⛏️ HashLayer Monitor (lite) — adres: ${Buffer.from(mnemonic).toString("hex").slice(0, 32)}`);
-  let lastLines = [];
+  console.log("⛏️ HashLayer Monitor — adres:", ADDRESS);
   setInterval(async () => {
-    const logPath = path.join(__dirname, "miner.log");
-    if (fs.existsSync(logPath)) {
-      const lines = fs.readFileSync(logPath, "utf8").trim().split("\n").slice(-10);
-      lastLines = lines;
-    }
-    const fails = lastLines.filter((l) => l.includes("failure")).length;
-    const succs = lastLines.filter((l) => l.includes("success")).length;
-    const balance = (Math.random() * 1.2).toFixed(6); // placeholder
+    // events z logu minera
+    const txt = await tailLines(400, LOG_FILE);
+    const ev = extractEvents(txt);
+
+    // SUI
+    let suiStr = "N/A";
+    try {
+      const sui = await getSuiBalance(ADDRESS);
+      if (!Number.isNaN(sui)) suiStr = sui.toFixed(6) + " SUI";
+    } catch {}
+
+    // HASH
+    let hashStr = "N/A";
+    try {
+      const hb = await getCoinBalance(ADDRESS, HASH_COIN);
+      if (!Number.isNaN(hb.amount)) {
+        hashStr = hb.amount.toFixed(Math.min(hb.decimals, 6)) + " " + hb.symbol;
+      }
+    } catch {}
+
     console.clear();
     console.log("=== HashLayer Miner Monitor ===");
-    console.log(`RPC:               ${rpc}`);
-    console.log(`Ostatnie zdarzenia: ${succs ? "✅" : "❌"} SUCC=${succs} | FAIL=${fails}`);
-    console.log(`Saldo:             ${balance} SUI`);
+    console.log("Adres:            ", ADDRESS);
+    console.log("RPC:              ", RPC);
+    console.log("Ostatnie zdarzenia:", ev);
+    console.log("Saldo SUI:        ", suiStr);
+    console.log("Saldo HASH:       ", hashStr);
     console.log("(Odświeżanie co 10s, Ctrl+C aby wyjść)");
-  }, 10000);
+  }, 10_000);
 })();
-EOF
-npm install dotenv @mysten/sui --no-save
-echo "✅ Monitor zainstalowany"
+\CJS
+sed -i '"'"'${/^\s*\(CJS\|EOF\)\s*$/d}'"'"' monitor-lite.cjs
 
-# ============================
-# (H) Synchronizacja czasu (ważne dla sukcesów!)
-# ============================
+# H) synchronizacja czasu (lepszy hit-rate)
 sudo apt install -y chrony
 sudo systemctl enable --now chrony
-chronyc tracking | head -n 5
+chronyc tracking | head -n 4
 
-# ============================
-# (I) Wykorzystanie wszystkich rdzeni
-# ============================
-CORES=$(nproc)
-echo "🔧 Wykryto $CORES wątków CPU — pełne wykorzystanie zostanie automatycznie ustawione przez Node.js."
-export UV_THREADPOOL_SIZE=$CORES
-
-# ============================
-# (J) Podsumowanie
-# ============================
 echo
-echo "=== ✅ INSTALACJA ZAKOŃCZONA ==="
-echo "➡️ Aby uruchomić koparkę:"
-echo "   cd ~/hash-layer-miner"
-echo "   npm run start"
-echo
-echo "➡️ Aby uruchomić monitor:"
-echo "   cd ~/hash-layer-miner"
-echo "   node monitor-lite.cjs"
-echo
-echo "➡️ Aby uruchomić oba w tmux:"
-echo "   tmux new -s miner"
-echo "   tmux new -s monitor"
-echo
-echo "💡 Log z minera: tail -f ~/hash-layer-miner/miner.log"
+echo "=== ✔ GOTOWE ==="
+echo "Koparka: cd ~/hash-layer-miner && npm run start"
+echo "Monitor: cd ~/hash-layer-miner && node monitor-lite.cjs"
+echo "Log:     tail -f ~/hash-layer-miner/miner.log"
+'
