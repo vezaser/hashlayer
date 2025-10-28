@@ -1,0 +1,15 @@
+# sprawdź co trzyma lock
+ps -fp 4036926
+
+# jeśli to unattended-upgrades/apt-daily – daj mu 1–2 min; jeśli wisi, zatrzymaj:
+sudo systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+sudo systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+# ubij proces (jeśli dalej żyje)
+sudo kill 4036926 2>/dev/null || true
+sleep 2
+
+# posprzątaj ewentualne locki i domknij rozgrzebane dpkg
+sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend
+sudo dpkg --configure -a
+sudo apt update
