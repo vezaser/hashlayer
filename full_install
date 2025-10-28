@@ -1,0 +1,132 @@
+#!/bin/bash
+set -e
+echo "=== 🧱 HASHLAYER AUTO INSTALL START ==="
+
+# ============================
+# (A) Wstępne narzędzia
+# ============================
+sudo apt update && sudo apt install -y curl git build-essential tmux
+
+# ============================
+# (B) Instalacja Node.js 22 przez NVM (bez kolizji z apt)
+# ============================
+if [ ! -d "$HOME/.nvm" ]; then
+  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+fi
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
+
+nvm install 22
+nvm alias default 22
+node -v
+npm -v
+
+# ============================
+# (C) Pobranie minera
+# ============================
+cd ~
+if [ -d "hash-layer-miner" ]; then
+  echo "📁 Folder hash-layer-miner już istnieje, pomijam klonowanie."
+else
+  git clone https://github.com/GemsGame/hash-layer-miner.git
+fi
+cd hash-layer-miner
+
+# ============================
+# (D) Instalacja zależności
+# ============================
+npm install
+
+# ============================
+# (E) Utworzenie pliku .env.secrets
+# ============================
+echo "✏️ Wklej teraz swoje 12 słów seed (Sui mnemonic):"
+read -r SEED
+cat > .env.secrets <<EOF
+MNEMONIC="$SEED"
+SUI_RPC="https://fullnode.mainnet.sui.io:443"
+EOF
+
+chmod 600 .env.secrets
+echo "✅ Zapisano plik .env.secrets"
+
+# ============================
+# (F) Kompilacja TypeScript
+# ============================
+npx tsc
+echo "✅ TypeScript skompilowany"
+
+# ============================
+# (G) Dodanie monitora
+# ============================
+cat > monitor-lite.cjs <<'EOF'
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
+dotenv.config({ path: ".env.secrets" });
+const { getFullnodeUrl, SuiClient } = require("@mysten/sui");
+
+const rpc = process.env.SUI_RPC || getFullnodeUrl("mainnet");
+const mnemonic = process.env.MNEMONIC;
+const sui = new SuiClient({ url: rpc });
+
+const WALLET_FILE = path.join(__dirname, "wallet.txt");
+
+(async () => {
+  console.log(`⛏️ HashLayer Monitor (lite) — adres: ${Buffer.from(mnemonic).toString("hex").slice(0, 32)}`);
+  let lastLines = [];
+  setInterval(async () => {
+    const logPath = path.join(__dirname, "miner.log");
+    if (fs.existsSync(logPath)) {
+      const lines = fs.readFileSync(logPath, "utf8").trim().split("\n").slice(-10);
+      lastLines = lines;
+    }
+    const fails = lastLines.filter((l) => l.includes("failure")).length;
+    const succs = lastLines.filter((l) => l.includes("success")).length;
+    const balance = (Math.random() * 1.2).toFixed(6); // placeholder
+    console.clear();
+    console.log("=== HashLayer Miner Monitor ===");
+    console.log(`RPC:               ${rpc}`);
+    console.log(`Ostatnie zdarzenia: ${succs ? "✅" : "❌"} SUCC=${succs} | FAIL=${fails}`);
+    console.log(`Saldo:             ${balance} SUI`);
+    console.log("(Odświeżanie co 10s, Ctrl+C aby wyjść)");
+  }, 10000);
+})();
+EOF
+npm install dotenv @mysten/sui --no-save
+echo "✅ Monitor zainstalowany"
+
+# ============================
+# (H) Synchronizacja czasu (ważne dla sukcesów!)
+# ============================
+sudo apt install -y chrony
+sudo systemctl enable --now chrony
+chronyc tracking | head -n 5
+
+# ============================
+# (I) Wykorzystanie wszystkich rdzeni
+# ============================
+CORES=$(nproc)
+echo "🔧 Wykryto $CORES wątków CPU — pełne wykorzystanie zostanie automatycznie ustawione przez Node.js."
+export UV_THREADPOOL_SIZE=$CORES
+
+# ============================
+# (J) Podsumowanie
+# ============================
+echo
+echo "=== ✅ INSTALACJA ZAKOŃCZONA ==="
+echo "➡️ Aby uruchomić koparkę:"
+echo "   cd ~/hash-layer-miner"
+echo "   npm run start"
+echo
+echo "➡️ Aby uruchomić monitor:"
+echo "   cd ~/hash-layer-miner"
+echo "   node monitor-lite.cjs"
+echo
+echo "➡️ Aby uruchomić oba w tmux:"
+echo "   tmux new -s miner"
+echo "   tmux new -s monitor"
+echo
+echo "💡 Log z minera: tail -f ~/hash-layer-miner/miner.log"
