@@ -1,0 +1,8 @@
+cd ~/hash-layer-miner
+rm -rf node_modules package-lock.json dist
+# (opcjonalnie, ale pomaga przy natywnych modułach)
+sudo apt install -y build-essential python3 make g++
+
+npm install
+npx tsc
+npm run start
