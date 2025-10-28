@@ -1,0 +1,91 @@
+sudo apt update && sudo apt install -y curl git tmux
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v && npm -v
+
+cd ~
+git clone https://github.com/GemsGame/hash-layer-miner.git
+cd ~/hash-layer-miner
+
+npm install
+
+read -s -p "Wklej swój 12-słowny seed Sui: " SEED; echo
+printf 'MNEMONIC="%s"\n' "$SEED" > .env.secrets
+echo 'SUI_RPC="https://fullnode.mainnet.sui.io:443"' >> .env.secrets
+chmod 600 .env.secrets
+
+npm install dotenv @mysten/sui --no-save
+
+cat > monitor.js <<'EOF'
+// monitor.js — prosty monitor HashLayer (saldo + ostatnie sukcesy/porażki)
+import { exec } from 'child_process';
+import dotenv from 'dotenv';
+import { Ed25519Keypair, JsonRpcProvider, Connection } from '@mysten/sui';
+
+dotenv.config({ path: '.env.secrets' });
+
+const LOG_FILE = './miner.log';
+const RPC = process.env.SUI_RPC || 'https://fullnode.mainnet.sui.io:443';
+
+function tailLines(n, file) {
+  return new Promise((res) => {
+    exec(`tail -n ${n} ${file}`, { maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+      if (err) return res('');
+      res(out || '');
+    });
+  });
+}
+
+async function getAddr(mn) {
+  const kp = await Ed25519Keypair.deriveKeypair(mn);
+  return kp.getPublicKey().toSuiAddress();
+}
+
+async function getBalance(provider, addr) {
+  try {
+    const b = await provider.getBalance({ owner: addr, coinType: '0x2::sui::SUI' });
+    return Number(b.totalBalance) / 1e9;
+  } catch { return NaN; }
+}
+
+function extractEvents(txt) {
+  const lines = txt.split('\n').reverse();
+  const events = [];
+  for (const L of lines) {
+    if (/status:\s*'success'|status:\s*success/i.test(L)) events.push('✅ SUCCESS');
+    if (/status:\s*'failure'|status:\s*failure|MoveAbort/i.test(L)) events.push('❌ FAIL');
+    if (events.length >= 6) break;
+  }
+  return events.reverse().join(' | ') || '(brak)';
+}
+
+(async () => {
+  const mnemonic = (process.env.MNEMONIC || '').trim();
+  if (!mnemonic) { console.log('Brak MNEMONIC w .env.secrets'); process.exit(1); }
+  const addr = await getAddr(mnemonic);
+  const provider = new JsonRpcProvider(new Connection({ fullnode: RPC }));
+
+  console.log('⛏️ HashLayer Monitor — adres:', addr);
+  setInterval(async () => {
+    const txt = await tailLines(400, LOG_FILE);
+    const ev = extractEvents(txt);
+    const bal = await getBalance(provider, addr);
+
+    console.clear();
+    console.log('=== HashLayer Miner Monitor ===');
+    console.log('Adres:           ', addr);
+    console.log('RPC:             ', RPC);
+    console.log('Ostatnie zdarzenia:', ev);
+    console.log('Saldo:           ', Number.isNaN(bal) ? 'N/A' : `${bal.toFixed(6)} SUI`);
+    console.log('(Odświeżanie co 10s, Ctrl+C aby wyjść)');
+  }, 10_000);
+})();
+EOF
+
+
+tmux kill-session -t hashlayer 2>/dev/null || true
+tmux new-session -d -s hashlayer -n miner 'bash -lc "cd ~/hash-layer-miner && npm run start >> miner.log 2>&1"'
+sleep 2
+tmux new-window  -t hashlayer:1 -n monitor 'bash -lc "cd ~/hash-layer-miner && node monitor.js"'
+tmux attach -t hashlayer
+
